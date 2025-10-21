@@ -1,9 +1,11 @@
 import dearpygui.dearpygui as dpg
 import numpy as np
-from queue import Empty
+from queue import Empty, Full
 import time
 import threading
+import cupy as cp
 
+from core.cam_manager import CamManager
 
 class CameraSelectorWidget:
     def __init__(self, cam_manager, start_callback=None, stop_callback=None):
@@ -63,7 +65,7 @@ class CameraSelectorWidget:
         
 
 class VideoStreamWidget: 
-    def __init__(self, cam_manager):
+    def __init__(self, cam_manager: CamManager):
         self.cam_manager = cam_manager
         self.update_video_texture_stop_event = threading.Event()
         self.update_video_texture_thread = None
@@ -87,24 +89,24 @@ class VideoStreamWidget:
     def update_video_texture(self):
         print("update_video_texture thread started")
         while not self.update_video_texture_stop_event.is_set():
-            try:
-                temp_frame = self.cam_manager.get_frame_test(type="avg")
-                if temp_frame is not None:
-                    try:
-                        dpg.set_value("video_texture", temp_frame)
-                        dpg.set_value("framerate_text", f"Proc. to Avg.: {self.cam_manager.get_time_avg(type='avg'):.2f} ms, Raw to Mono: {self.cam_manager.get_time_avg(type='proc'):.2f} ms, Mono to RGB: {self.cam_manager.get_time_avg(type='mono'):.2f} ms")
-                        dpg.set_value("frame_drop_text", f"Raw Drop: {self.cam_manager.get_drop_ctr(type='raw')}, Processed Drop: {self.cam_manager.get_drop_ctr(type='processed')}, Avg Drop: {self.cam_manager.get_drop_ctr(type='avg')}")
-                    except Exception as e:
-                        # DearPyGui context might be destroyed, exit gracefully
-                        print(f"DearPyGui context error in update_video_texture: {e}")
-                        break
-                else:
-                    # No frame available, sleep briefly to avoid busy waiting
-                    time.sleep(0.005)
+            try:             
+                temp_frame = self.cam_manager.get_frame(type="avg")          
+                           
+                print(f"temp_frame shape: {temp_frame.shape}")
+                print(f"frame type: {type(temp_frame)}")
+                dpg.set_value("video_texture", cp.asnumpy(temp_frame))
+                        #dpg.set_value("framerate_text", f"Proc. to Avg.: {self.cam_manager.get_time_avg(type='avg'):.2f} ms, Raw to Mono: {self.cam_manager.get_time_avg(type='proc'):.2f} ms, Mono to RGB: {self.cam_manager.get_time_avg(type='mono'):.2f} ms")
+                        #dpg.set_value("frame_drop_text", f"Raw Drop: {self.cam_manager.get_drop_ctr(type='raw')}, Processed Drop: {self.cam_manager.get_drop_ctr(type='processed')}, Avg Drop: {self.cam_manager.get_drop_ctr(type='avg')}")
+                   
+              
+            except Empty:                 
+                time.sleep(0.01)
+                continue
+
             except Exception as e:
-                # Handle any other unexpected errors
                 print(f"Error in update_video_texture: {e}")
-                break
+                continue
+                
         print("update_video_texture thread exiting")
 
     def start_display(self):

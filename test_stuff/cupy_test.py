@@ -56,11 +56,11 @@ void demosaic_bayer_rg12(const unsigned short* __restrict__ src,
 
 # ---------------- GPU QUEUE ----------------
 class GPUQueue:
-    def __init__(self, capacity: int, shape: tuple, dtype=cp.float32):
-        self.capacity = capacity
+    def __init__(self, max_size: int, shape: tuple, dtype=cp.float32):
+        self.capacity = max_size
         self.shape = shape
         self.dtype = dtype
-        self.queue = cp.zeros((capacity, *shape), dtype=dtype)
+        self.queue = cp.zeros((max_size, *shape), dtype=dtype)
         self.head = 0
         self.tail = 0
         self.size = 0
