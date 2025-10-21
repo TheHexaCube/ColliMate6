@@ -1,5 +1,6 @@
 import cupy as cp
 from queue import Full, Empty
+import threading
 
 class GPUQueue:
     def __init__(self, max_size: int, shape: tuple, dtype=cp.float32):
@@ -10,35 +11,71 @@ class GPUQueue:
         self.head = 0
         self.tail = 0
         self.size = 0
+        self._lock = threading.Lock()
 
     def put(self, item: cp.ndarray):
-        if self.is_full():
-            raise Full
-        # direct copy into queue slot
-        self.queue[self.tail][:] = item.astype(self.dtype, copy=False)
-        self.tail = (self.tail + 1) % self.max_size
-        self.size += 1
+        with self._lock:
+            if self.size == self.max_size:
+                raise Full
+            # direct copy into queue slot
+            self.queue[self.tail][:] = item.astype(self.dtype, copy=False)
+            self.tail = (self.tail + 1) % self.max_size
+            self.size += 1
+
+    def put_overwrite(self, item: cp.ndarray) -> bool:
+        """
+        Put item into the queue; if full, overwrite the oldest frame.
+        Returns True if an old frame was overwritten.
+        """
+        with self._lock:
+            overwritten = self.size == self.max_size
+            # copy into current tail position
+            self.queue[self.tail][:] = item.astype(self.dtype, copy=False)
+            if overwritten:
+                # advance head to drop the oldest
+                self.head = (self.head + 1) % self.max_size
+            else:
+                self.size += 1
+            self.tail = (self.tail + 1) % self.max_size
+            return overwritten
 
     def get_view(self):
-        if self.is_empty():
-            raise Empty
-        idx = self.head
-        self.head = (self.head + 1) % self.max_size
-        self.size -= 1
-        return self.queue[idx]
+        with self._lock:
+            if self.size == 0:
+                raise Empty
+            idx = self.head
+            self.head = (self.head + 1) % self.max_size
+            self.size -= 1
+            return self.queue[idx]
 
     def get_queue_view(self):
         return self.queue
 
     def discard_frame(self):        
-        if self.is_empty():
-            raise Empty
-        self.head = (self.head + 1) % self.max_size
-        self.size -= 1
+        with self._lock:
+            if self.size == 0:
+                raise Empty
+            self.head = (self.head + 1) % self.max_size
+            self.size -= 1
 
-    def is_empty(self): return self.size == 0
-    def is_full(self): return self.size == self.max_size
-    def clear(self): self.head = self.tail = self.size = 0
+    def is_empty(self):
+        with self._lock:
+            return self.size == 0
+
+    def is_full(self):
+        with self._lock:
+            return self.size == self.max_size
+
+    def clear(self):
+        with self._lock:
+            self.head = 0
+            self.tail = 0
+            self.size = 0
+
+    def snapshot_state(self):
+        """Atomically snapshot (head, tail, size)."""
+        with self._lock:
+            return self.head, self.tail, self.size
 
 
 kernel_demosaic = cp.RawKernel(r'''
@@ -92,45 +129,292 @@ def run_demosaic(src: cp.ndarray, dst: cp.ndarray):
     blocks = ((w + 15) // 16, (h + 15) // 16)
     kernel_demosaic(blocks, threads, (src, dst, w, h))
 
+# Module-scope kernel for windowed averaging of last K frames
+kernel_avg_q_windowed = cp.RawKernel(r'''
+extern "C" __global__
+void avg_gpuqueue_windowed(const float* frames, float* out,
+                           const int max_size, const int count,
+                           const int tail, const int h, const int w, const int c)
+{
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int size = h * w * c;
+    if (idx >= size) return;
 
-def average_gpuqueue(q: "GPUQueue", out: cp.ndarray):
+    float s = 0.0f;
+    // accumulate last `count` frames from tail-1 backwards
+    for (int i = 0; i < count; ++i) {
+        int q_idx = ( (tail - 1 - i) % max_size + max_size ) % max_size; // safe mod
+        s += frames[q_idx * size + idx];
+    }
+    out[idx] = s / (float)count;
+}
+''', 'avg_gpuqueue_windowed')
+
+
+def average_gpuqueue_windowed(q: "GPUQueue", out: cp.ndarray, window: int) -> int:
     """
-    Average all valid frames in GPUQueue into `out` (on-GPU, in place).
-    Expects q.queue shape = (max_size, h, w[, c]) and dtype float32.
+    Average last `min(window, size)` frames in GPUQueue into `out` (on-GPU).
+    Returns the number of frames used for averaging.
     """
-    if q.is_empty():
+    head, tail, size = q.snapshot_state()
+    if size == 0:
         raise ValueError("Queue is empty")
 
-    n = q.size
     h, w = q.shape[:2]
     c = q.shape[2] if len(q.shape) == 3 else 1
-    size = h * w * c
+    count = int(min(window, size))
+
+    total_elems = h * w * c
     threads = 256
-    blocks = (size + threads - 1) // threads
+    blocks = (total_elems + threads - 1) // threads
 
-    print(f"Average GPUQueue: {n} frames")
-
-    kernel_avg_q = cp.RawKernel(r'''
-    extern "C" __global__
-    void avg_gpuqueue(const float* frames, float* out,
-                      const int max_size, const int n,
-                      const int head, const int h, const int w, const int c)
-    {
-        int idx = blockDim.x * blockIdx.x + threadIdx.x;
-        int size = h * w * c;
-        if (idx >= size) return;
-
-        float s = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            int q_idx = (head + i) % max_size;
-            s += frames[q_idx * size + idx];
-        }
-        out[idx] = s / n;
-    }
-    ''', "avg_gpuqueue")
-
-    kernel_avg_q(
+    kernel_avg_q_windowed(
         (blocks,), (threads,),
-        (q.queue, out, q.max_size, n, q.head, h, w, c)
+        (q.queue, out, q.max_size, count, tail, h, w, c)
     )
-    cp.cuda.Device().synchronize()
+
+    return count
+
+
+# ============================================================================
+# Overlay Drawing Kernels
+# ============================================================================
+
+kernel_draw_line = cp.RawKernel(r'''
+extern "C" __global__
+void draw_line(float* overlay, const int width, const int height,
+               const int x0, const int y0, const int x1, const int y1,
+               const float r, const float g, const float b, const float a,
+               const int thickness)
+{
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = width * height;
+    if (idx >= total) return;
+    
+    int px = idx % width;
+    int py = idx / width;
+    
+    // Bresenham distance to line segment
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    
+    // Compute perpendicular distance from point to line
+    float len_sq = (float)(dx*dx + dy*dy);
+    if (len_sq < 1.0f) {
+        // Degenerate line (point)
+        int dist = abs(px - x0) + abs(py - y0);
+        if (dist <= thickness) {
+            int offset = idx * 4;
+            overlay[offset + 0] = r;
+            overlay[offset + 1] = g;
+            overlay[offset + 2] = b;
+            overlay[offset + 3] = a;
+        }
+        return;
+    }
+    
+    // Project point onto line segment
+    float t = ((px - x0) * dx + (py - y0) * dy) / len_sq;
+    t = fmaxf(0.0f, fminf(1.0f, t));
+    
+    float proj_x = x0 + t * dx;
+    float proj_y = y0 + t * dy;
+    
+    float dist = sqrtf((px - proj_x)*(px - proj_x) + (py - proj_y)*(py - proj_y));
+    
+    if (dist <= (float)thickness * 0.5f) {
+        int offset = idx * 4;
+        overlay[offset + 0] = r;
+        overlay[offset + 1] = g;
+        overlay[offset + 2] = b;
+        overlay[offset + 3] = a;
+    }
+}
+''', 'draw_line')
+
+
+kernel_draw_circle = cp.RawKernel(r'''
+extern "C" __global__
+void draw_circle(float* overlay, const int width, const int height,
+                 const int cx, const int cy, const float radius,
+                 const float r, const float g, const float b, const float a,
+                 const int thickness, const int filled)
+{
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = width * height;
+    if (idx >= total) return;
+    
+    int px = idx % width;
+    int py = idx / width;
+    
+    float dx = (float)(px - cx);
+    float dy = (float)(py - cy);
+    float dist = sqrtf(dx*dx + dy*dy);
+    
+    int draw = 0;
+    if (filled) {
+        draw = (dist <= radius);
+    } else {
+        float inner = radius - (float)thickness * 0.5f;
+        float outer = radius + (float)thickness * 0.5f;
+        draw = (dist >= inner && dist <= outer);
+    }
+    
+    if (draw) {
+        int offset = idx * 4;
+        overlay[offset + 0] = r;
+        overlay[offset + 1] = g;
+        overlay[offset + 2] = b;
+        overlay[offset + 3] = a;
+    }
+}
+''', 'draw_circle')
+
+
+kernel_draw_cross = cp.RawKernel(r'''
+extern "C" __global__
+void draw_cross(float* overlay, 
+                int width, int height, int cx, int cy, int thickness,
+                float size, float r, float g, float b, float a, float rotation)
+{
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = width * height;
+    if (idx >= total) return;
+    
+    int px = idx % width;
+    int py = idx / width;
+    
+    // Distance from center
+    int dx = px - cx;
+    int dy = py - cy;
+    
+    // Rotate point
+    float cos_r = cosf(-rotation);
+    float sin_r = sinf(-rotation);
+    float rx = (float)dx * cos_r - (float)dy * sin_r;
+    float ry = (float)dx * sin_r + (float)dy * cos_r;
+    
+    int abs_rx = (int)((rx < 0.0f) ? -rx : rx);
+    int abs_ry = (int)((ry < 0.0f) ? -ry : ry);
+    
+    int isize = (int)size;
+    int half_thick = thickness / 2;
+    
+    // Horizontal arm (along rotated x-axis)
+    int on_horizontal = (abs_ry <= half_thick) && (abs_rx <= isize);
+    
+    // Vertical arm (along rotated y-axis)
+    int on_vertical = (abs_rx <= half_thick) && (abs_ry <= isize);
+    
+    if (on_horizontal || on_vertical) {
+        int offset = idx * 4;
+        overlay[offset + 0] = r;
+        overlay[offset + 1] = g;
+        overlay[offset + 2] = b;
+        overlay[offset + 3] = a;
+    }
+}
+''', 'draw_cross')
+
+
+kernel_alpha_composite = cp.RawKernel(r'''
+extern "C" __global__
+void alpha_composite(const float* rgb, const float* overlay, float* out,
+                     const int width, const int height)
+{
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = width * height;
+    if (idx >= total) return;
+    
+    int rgb_offset = idx * 3;
+    int rgba_offset = idx * 4;
+    
+    float alpha = overlay[rgba_offset + 3];
+    
+    if (alpha > 0.0f) {
+        float inv_alpha = 1.0f - alpha;
+        out[rgb_offset + 0] = rgb[rgb_offset + 0] * inv_alpha + overlay[rgba_offset + 0] * alpha;
+        out[rgb_offset + 1] = rgb[rgb_offset + 1] * inv_alpha + overlay[rgba_offset + 1] * alpha;
+        out[rgb_offset + 2] = rgb[rgb_offset + 2] * inv_alpha + overlay[rgba_offset + 2] * alpha;
+    } else {
+        // No overlay, just copy RGB
+        out[rgb_offset + 0] = rgb[rgb_offset + 0];
+        out[rgb_offset + 1] = rgb[rgb_offset + 1];
+        out[rgb_offset + 2] = rgb[rgb_offset + 2];
+    }
+}
+''', 'alpha_composite')
+
+
+# Python wrapper functions for drawing primitives
+
+def draw_line(overlay: cp.ndarray, x0: int, y0: int, x1: int, y1: int,
+              color: tuple, thickness: int):
+    """Draw a line into RGBA overlay buffer."""
+    import numpy as np
+    h, w = overlay.shape[:2]
+    total = h * w
+    threads = 256
+    blocks = (total + threads - 1) // threads
+    
+    r, g, b, a = color
+    # Use ravel to get a contiguous 1D view
+    overlay_1d = overlay.ravel()
+    kernel_draw_line(
+        (blocks,), (threads,),
+        (overlay_1d, np.int32(w), np.int32(h), np.int32(x0), np.int32(y0), np.int32(x1), np.int32(y1), 
+         np.float32(r), np.float32(g), np.float32(b), np.float32(a), np.int32(thickness))
+    )
+
+
+def draw_circle(overlay: cp.ndarray, cx: int, cy: int, radius: float,
+                color: tuple, thickness: int, filled: bool):
+    """Draw a circle into RGBA overlay buffer."""
+    import numpy as np
+    h, w = overlay.shape[:2]
+    total = h * w
+    threads = 256
+    blocks = (total + threads - 1) // threads
+    
+    r, g, b, a = color
+    # Use ravel to get a contiguous 1D view
+    overlay_1d = overlay.ravel()
+    kernel_draw_circle(
+        (blocks,), (threads,),
+        (overlay_1d, np.int32(w), np.int32(h), np.int32(cx), np.int32(cy), np.float32(radius), 
+         np.float32(r), np.float32(g), np.float32(b), np.float32(a), np.int32(thickness), np.int32(int(filled)))
+    )
+
+
+def draw_cross(overlay: cp.ndarray, cx: int, cy: int, size: float,
+               color: tuple, thickness: int, rotation: float):
+    """Draw a rotated cross into RGBA overlay buffer."""
+    import numpy as np
+    h, w = overlay.shape[:2]
+    total = h * w
+    threads = 256
+    blocks = (total + threads - 1) // threads
+    
+    r, g, b, a = color
+    # Use ravel to get a contiguous 1D view
+    overlay_1d = overlay.ravel()
+    # Parameter order: ints first, then floats (for proper CUDA alignment)
+    # CRITICAL: Must use np.int32() and np.float32() for proper CUDA parameter passing!
+    kernel_draw_cross(
+        (blocks,), (threads,),
+        (overlay_1d, np.int32(w), np.int32(h), np.int32(cx), np.int32(cy), np.int32(thickness),
+         np.float32(size), np.float32(r), np.float32(g), np.float32(b), np.float32(a), np.float32(rotation))
+    )
+
+
+def composite_overlay(rgb_frame: cp.ndarray, overlay: cp.ndarray, out: cp.ndarray):
+    """Alpha-composite RGBA overlay onto RGB frame."""
+    h, w = rgb_frame.shape[:2]
+    total = h * w
+    threads = 256
+    blocks = (total + threads - 1) // threads
+    
+    kernel_alpha_composite(
+        (blocks,), (threads,),
+        (rgb_frame, overlay, out, w, h)
+    )
