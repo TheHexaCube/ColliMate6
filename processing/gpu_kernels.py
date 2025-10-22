@@ -1,82 +1,9 @@
 import cupy as cp
-from queue import Full, Empty
-import threading
+import numpy as np
 
-class GPUQueue:
-    def __init__(self, max_size: int, shape: tuple, dtype=cp.float32):
-        self.max_size = max_size
-        self.shape = shape
-        self.dtype = dtype
-        self.queue = cp.zeros((max_size, *shape), dtype=dtype)
-        self.head = 0
-        self.tail = 0
-        self.size = 0
-        self._lock = threading.Lock()
-
-    def put(self, item: cp.ndarray):
-        with self._lock:
-            if self.size == self.max_size:
-                raise Full
-            # direct copy into queue slot
-            self.queue[self.tail][:] = item.astype(self.dtype, copy=False)
-            self.tail = (self.tail + 1) % self.max_size
-            self.size += 1
-
-    def put_overwrite(self, item: cp.ndarray) -> bool:
-        """
-        Put item into the queue; if full, overwrite the oldest frame.
-        Returns True if an old frame was overwritten.
-        """
-        with self._lock:
-            overwritten = self.size == self.max_size
-            # copy into current tail position
-            self.queue[self.tail][:] = item.astype(self.dtype, copy=False)
-            if overwritten:
-                # advance head to drop the oldest
-                self.head = (self.head + 1) % self.max_size
-            else:
-                self.size += 1
-            self.tail = (self.tail + 1) % self.max_size
-            return overwritten
-
-    def get_view(self):
-        with self._lock:
-            if self.size == 0:
-                raise Empty
-            idx = self.head
-            self.head = (self.head + 1) % self.max_size
-            self.size -= 1
-            return self.queue[idx]
-
-    def get_queue_view(self):
-        return self.queue
-
-    def discard_frame(self):        
-        with self._lock:
-            if self.size == 0:
-                raise Empty
-            self.head = (self.head + 1) % self.max_size
-            self.size -= 1
-
-    def is_empty(self):
-        with self._lock:
-            return self.size == 0
-
-    def is_full(self):
-        with self._lock:
-            return self.size == self.max_size
-
-    def clear(self):
-        with self._lock:
-            self.head = 0
-            self.tail = 0
-            self.size = 0
-
-    def snapshot_state(self):
-        """Atomically snapshot (head, tail, size)."""
-        with self._lock:
-            return self.head, self.tail, self.size
-
+# ============================================================================
+# Demosaic Kernel
+# ============================================================================
 
 kernel_demosaic = cp.RawKernel(r'''
 extern "C" __global__
@@ -129,7 +56,10 @@ def run_demosaic(src: cp.ndarray, dst: cp.ndarray):
     blocks = ((w + 15) // 16, (h + 15) // 16)
     kernel_demosaic(blocks, threads, (src, dst, w, h))
 
-# Module-scope kernel for windowed averaging of last K frames
+# ============================================================================
+# Averaging Kernel
+# ============================================================================
+
 kernel_avg_q_windowed = cp.RawKernel(r'''
 extern "C" __global__
 void avg_gpuqueue_windowed(const float* frames, float* out,
@@ -151,7 +81,7 @@ void avg_gpuqueue_windowed(const float* frames, float* out,
 ''', 'avg_gpuqueue_windowed')
 
 
-def average_gpuqueue_windowed(q: "GPUQueue", out: cp.ndarray, window: int) -> int:
+def average_gpuqueue_windowed(q, out: cp.ndarray, window: int) -> int:
     """
     Average last `min(window, size)` frames in GPUQueue into `out` (on-GPU).
     Returns the number of frames used for averaging.
@@ -174,7 +104,6 @@ def average_gpuqueue_windowed(q: "GPUQueue", out: cp.ndarray, window: int) -> in
     )
 
     return count
-
 
 # ============================================================================
 # Overlay Drawing Kernels
@@ -345,13 +274,13 @@ void alpha_composite(const float* rgb, const float* overlay, float* out,
 }
 ''', 'alpha_composite')
 
-
+# ============================================================================
 # Python wrapper functions for drawing primitives
+# ============================================================================
 
 def draw_line(overlay: cp.ndarray, x0: int, y0: int, x1: int, y1: int,
               color: tuple, thickness: int):
     """Draw a line into RGBA overlay buffer."""
-    import numpy as np
     h, w = overlay.shape[:2]
     total = h * w
     threads = 256
@@ -370,7 +299,6 @@ def draw_line(overlay: cp.ndarray, x0: int, y0: int, x1: int, y1: int,
 def draw_circle(overlay: cp.ndarray, cx: int, cy: int, radius: float,
                 color: tuple, thickness: int, filled: bool):
     """Draw a circle into RGBA overlay buffer."""
-    import numpy as np
     h, w = overlay.shape[:2]
     total = h * w
     threads = 256
@@ -389,7 +317,6 @@ def draw_circle(overlay: cp.ndarray, cx: int, cy: int, radius: float,
 def draw_cross(overlay: cp.ndarray, cx: int, cy: int, size: float,
                color: tuple, thickness: int, rotation: float):
     """Draw a rotated cross into RGBA overlay buffer."""
-    import numpy as np
     h, w = overlay.shape[:2]
     total = h * w
     threads = 256

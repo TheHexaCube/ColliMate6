@@ -7,8 +7,8 @@ into a shared RGBA overlay buffer with dirty-flag based caching.
 
 import cupy as cp
 from typing import List
-from core.primitives import OverlayPrimitive
-from core.gpu import composite_overlay
+from .primitives import OverlayPrimitive
+from processing.gpu_kernels import composite_overlay
 
 
 class OverlayManager:

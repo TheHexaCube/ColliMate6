@@ -5,8 +5,8 @@ sys.path.insert(0, 'D:\\EDA\\projects\\hexacube\\autocollimator\\ColliMate6')
 
 import cupy as cp
 import time
-from core.primitives import Line
-from core.roi_analyzer import ROIAnalyzer
+from visualization.primitives import Line
+from analysis.roi_analyzer import ROIAnalyzer
 
 # Mock CamManager for testing
 class MockCamManager:

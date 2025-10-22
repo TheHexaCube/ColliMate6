@@ -4,7 +4,7 @@ import sys
 sys.path.insert(0, 'D:\\EDA\\projects\\hexacube\\autocollimator\\ColliMate6')
 
 import cupy as cp
-from core.gpu import draw_cross, draw_circle, draw_line
+from processing.gpu_kernels import draw_cross, draw_circle, draw_line
 
 # Create a small test overlay buffer
 h, w = 100, 100
@@ -92,7 +92,7 @@ overlay.fill(0.0)
 
 # Try calling the cross kernel directly
 print(f"\n=== Calling draw_cross kernel directly ===")
-from core.gpu import kernel_draw_cross
+from processing.gpu_kernels import kernel_draw_cross
 overlay_1d = overlay.ravel()
 print(f"Overlay 1D shape: {overlay_1d.shape}, is contiguous: {overlay_1d.flags.c_contiguous}")
 print(f"Kernel grid: blocks={blocks}, threads={threads}")

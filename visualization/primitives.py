@@ -131,7 +131,7 @@ class Line(OverlayPrimitive):
     
     def render_to_buffer(self, overlay_buffer: cp.ndarray):
         """Render line into RGBA overlay buffer."""
-        from core.gpu import draw_line
+        from processing.gpu_kernels import draw_line
         if self._visible:
             draw_line(overlay_buffer, 
                      int(self._start_x), int(self._start_y),
@@ -354,7 +354,7 @@ class Cross(OverlayPrimitive):
     
     def render_to_buffer(self, overlay_buffer: cp.ndarray):
         """Render rotated cross into RGBA overlay buffer."""
-        from core.gpu import draw_cross
+        from processing.gpu_kernels import draw_cross
         if self._visible:
             draw_cross(overlay_buffer,
                       int(self._center_x), int(self._center_y),
@@ -426,7 +426,7 @@ class Circle(OverlayPrimitive):
     
     def render_to_buffer(self, overlay_buffer: cp.ndarray):
         """Render circle into RGBA overlay buffer."""
-        from core.gpu import draw_circle
+        from processing.gpu_kernels import draw_circle
         if self._visible:
             draw_circle(overlay_buffer,
                        int(self._center_x), int(self._center_y),

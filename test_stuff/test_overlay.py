@@ -7,7 +7,7 @@ camera display with alpha transparency.
 
 import time
 import math
-from core.primitives import Line, Cross, Circle
+from visualization.primitives import Line, Cross, Circle
 
 
 def add_test_primitives(cam_manager):

@@ -7,8 +7,8 @@ import cupy as cp
 
 # Force reload of the module to get latest kernel
 import importlib
-import core.gpu
-importlib.reload(core.gpu)
+import processing.gpu_kernels
+importlib.reload(processing.gpu_kernels)
 
 # Create test buffer
 h, w = 100, 100

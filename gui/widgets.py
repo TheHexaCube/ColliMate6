@@ -5,7 +5,7 @@ import time
 import threading
 import cupy as cp
 
-from core.cam_manager import CamManager
+from camera.cam_manager import CamManager
 
 class CameraSelectorWidget:
     def __init__(self, cam_manager, start_callback=None, stop_callback=None):

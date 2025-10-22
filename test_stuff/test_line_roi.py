@@ -5,7 +5,7 @@ sys.path.insert(0, 'D:\\EDA\\projects\\hexacube\\autocollimator\\ColliMate6')
 
 import cupy as cp
 import numpy as np
-from core.primitives import Line
+from visualization.primitives import Line
 
 # Create a test image with a gradient
 h, w = 480, 640

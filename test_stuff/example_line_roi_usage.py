@@ -13,7 +13,7 @@ sys.path.insert(0, 'D:\\EDA\\projects\\hexacube\\autocollimator\\ColliMate6')
 
 import cupy as cp
 import numpy as np
-from core.primitives import Line
+from visualization.primitives import Line
 
 # Simulating camera frame (replace with actual cam_manager.get_frame())
 def get_simulated_frame(width=640, height=480):
@@ -141,7 +141,7 @@ print("=" * 70)
 example_code = """
 # In your actual application with camera manager:
 
-from core.primitives import Line
+from visualization.primitives import Line
 import cupy as cp
 
 # Setup

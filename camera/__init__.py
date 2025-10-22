@@ -1,0 +1,1 @@
+"""Camera hardware interface module."""
